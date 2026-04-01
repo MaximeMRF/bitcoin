@@ -1286,7 +1286,7 @@ static auto InitBlocksdirXorKey(const BlockManager::Options& opts)
     } else {
         // Create initial or missing xor key file
         AutoFile xor_key_file{fsbridge::fopen(xor_key_path,
-#ifdef __MINGW64__
+#if 0
             "wb" // Temporary workaround for https://github.com/bitcoin/bitcoin/issues/30210
 #else
             "wbx"
@@ -1393,7 +1393,7 @@ void ImportBlocks(ChainstateManager& chainman, std::span<const fs::path> import_
                 return;
             }
         } else {
-            LogPrintf("Warning: Could not open blocks file %s\n", fs::PathToString(path));
+            LogWarning("Could not open blocks file %s", fs::PathToString(path));
         }
     }
 

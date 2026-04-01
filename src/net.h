@@ -97,6 +97,9 @@ static constexpr bool DEFAULT_V2_TRANSPORT{true};
 
 typedef int64_t NodeId;
 
+/** Get the score of a local address. */
+int GetnScore(const CService& addr);
+
 struct AddedNodeParams {
     std::string m_added_node;
     bool m_use_v2transport;
@@ -1114,6 +1117,7 @@ public:
         bool m_i2p_accept_incoming;
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
+        bool m_capture_messages = false;
         bool disable_v1conn_clearnet = false;
     };
 
@@ -1154,8 +1158,12 @@ public:
         m_listenonion = connOptions.listenonion;
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
         whitelist_relay = connOptions.whitelist_relay;
+        m_capture_messages = connOptions.m_capture_messages;
         disable_v1conn_clearnet = connOptions.disable_v1conn_clearnet;
     }
+
+    // test only
+    void SetCaptureMessages(bool cap) { m_capture_messages = cap; }
 
     CConnman(uint64_t seed0, uint64_t seed1, AddrMan& addrman, const NetGroupManager& netgroupman,
              const CChainParams& params, bool network_active = true);
@@ -1165,9 +1173,10 @@ public:
     bool Start(CScheduler& scheduler, const Options& options) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_added_nodes_mutex, !m_addr_fetches_mutex, !mutexMsgProc);
 
     void StopThreads();
-    void StopNodes();
-    void Stop()
+    void StopNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex);
+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex)
     {
+        AssertLockNotHeld(m_reconnections_mutex);
         StopThreads();
         StopNodes();
     };
@@ -1310,7 +1319,7 @@ public:
     void WakeMessageHandler() EXCLUSIVE_LOCKS_REQUIRED(!mutexMsgProc);
 
     /** Return true if we should disconnect the peer for failing an inactivity check. */
-    bool ShouldRunInactivityChecks(const CNode& node, std::chrono::seconds now) const;
+    bool ShouldRunInactivityChecks(const CNode& node, std::chrono::microseconds now) const;
 
     bool MultipleManualOrFullOutboundConns(Network net) const EXCLUSIVE_LOCKS_REQUIRED(m_nodes_mutex);
 
@@ -1363,7 +1372,7 @@ private:
     void DisconnectNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_nodes_mutex);
     void NotifyNumConnectionsChanged();
     /** Return true if the peer is inactive and should be disconnected. */
-    bool InactivityCheck(const CNode& node) const;
+    bool InactivityCheck(const CNode& node, std::chrono::microseconds now) const;
 
     /**
      * Generate a collection of sockets to check for IO readiness.
@@ -1645,6 +1654,11 @@ private:
      * and manual peers with default permissions.
      */
     bool whitelist_relay;
+
+    /**
+     * flag for whether messages are captured
+     */
+    bool m_capture_messages{false};
 
     /**
      * option for disabling outbound v1 connections on IPV4 and IPV6.
