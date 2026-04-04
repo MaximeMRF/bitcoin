@@ -56,8 +56,8 @@ struct bilingual_str;
 
 /** Time after which to disconnect, after waiting for a ping response (or inactivity). */
 static constexpr std::chrono::minutes TIMEOUT_INTERVAL{10};
-/** Run the feeler connection loop once every 2 minutes. **/
-static constexpr auto FEELER_INTERVAL = 2min;
+/** Run the feeler connection loop once every 1 minutes. **/
+static constexpr auto FEELER_INTERVAL = 1min;
 /** Run the extra block-relay-only connection loop once every 5 minutes. **/
 static constexpr auto EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL = 5min;
 /** Maximum length of incoming protocol messages (no message over 4 MB is currently acceptable). */
@@ -65,17 +65,17 @@ static const unsigned int MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000;
 /** Maximum length of the user agent string in `version` message */
 static const unsigned int MAX_SUBVERSION_LENGTH = 256;
 /** Maximum number of automatic outgoing nodes over which we'll relay everything (blocks, tx, addrs, etc) */
-static const int MAX_OUTBOUND_FULL_RELAY_CONNECTIONS = 256;
+static const int MAX_OUTBOUND_FULL_RELAY_CONNECTIONS = 512;
 /** Maximum number of addnode outgoing nodes */
-static const int MAX_ADDNODE_CONNECTIONS = 256;
+static const int MAX_ADDNODE_CONNECTIONS = 512;
 /** Maximum number of block-relay-only outgoing connections */
-static const int MAX_BLOCK_RELAY_ONLY_CONNECTIONS = 2;
+static const int MAX_BLOCK_RELAY_ONLY_CONNECTIONS = 64;
 /** Maximum number of feeler connections */
-static const int MAX_FEELER_CONNECTIONS = 1;
+static const int MAX_FEELER_CONNECTIONS = 2;
 /** -listen default */
 static const bool DEFAULT_LISTEN = true;
 /** The maximum number of peer connections to maintain. */
-static const unsigned int DEFAULT_MAX_PEER_CONNECTIONS = 1000;
+static const unsigned int DEFAULT_MAX_PEER_CONNECTIONS = 2048;
 /** The default for -maxuploadtarget. 0 = Unlimited */
 static const std::string DEFAULT_MAX_UPLOAD_TARGET{"0M"};
 /** Default for blocks only*/
