@@ -7,6 +7,7 @@
 #include <blockfilter.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <chainparamsbase.h>
 #include <common/args.h>
 #include <common/pcp.h>
 #include <consensus/merkle.h>
@@ -185,7 +186,11 @@ public:
     {
         args().WriteSettingsFile(/*errors=*/nullptr, /*backup=*/true);
         args().LockSettings([&](common::Settings& settings) {
-            settings.rw_settings.clear();
+            std::map<std::string, common::SettingsValue> new_rw_settings;
+            if (auto it = settings.rw_settings.find(CONSENSUSRULES_CONFIG_NAME); it != settings.rw_settings.end()) {
+                new_rw_settings.emplace(it->first, std::move(it->second));
+            }
+            settings.rw_settings.swap(new_rw_settings);
         });
         args().WriteSettingsFile();
     }
@@ -415,6 +420,9 @@ public:
     }
     std::unique_ptr<Handler> handleBannedListChanged(BannedListChangedFn fn) override
     {
+        if (m_context->banman) {
+            m_context->banman->EnsureSweepScheduled();
+        }
         return MakeSignalHandler(::uiInterface.BannedListChanged_connect(fn));
     }
     std::unique_ptr<Handler> handleNotifyBlockTip(NotifyBlockTipFn fn) override
@@ -830,6 +838,10 @@ public:
     void waitForNotificationsIfTipChanged(const uint256& old_tip) override
     {
         if (!old_tip.IsNull() && old_tip == WITH_LOCK(::cs_main, return chainman().ActiveChain().Tip()->GetBlockHash())) return;
+        validation_signals().SyncWithValidationInterfaceQueue();
+    }
+    void waitForNotifications() override
+    {
         validation_signals().SyncWithValidationInterfaceQueue();
     }
     std::unique_ptr<Handler> handleRpc(const CRPCCommand& command) override

@@ -615,7 +615,7 @@ static RPCHelpMan sweepprivkeys()
     // Parse options
     std::set<CScript> needles;
     wallet::CCoinControl coin_control;
-    FillableSigningProvider temp_keystore;
+    FlatSigningProvider temp_keystore;
     CMutableTransaction tx;
     std::string label;
     CAmount total_in = 0;
@@ -631,7 +631,8 @@ static RPCHelpMan sweepprivkeys()
                 CPubKey pubkey = key.GetPubKey();
                 CHECK_NONFATAL(key.VerifyPubKey(pubkey));
 
-                temp_keystore.AddKey(key);
+                temp_keystore.keys[pubkey.GetID()] = key;
+                temp_keystore.pubkeys[pubkey.GetID()] = pubkey;
                 CKeyID address = pubkey.GetID();
                 CScript script = GetScriptForDestination(PKHash(address));
                 if (!script.empty()) {
@@ -640,6 +641,25 @@ static RPCHelpMan sweepprivkeys()
                 script = GetScriptForRawPubKey(pubkey);
                 if (!script.empty()) {
                     needles.insert(script);
+                }
+                if (pubkey.IsCompressed()) {
+                    CScript p2wpkh_script = GetScriptForDestination(WitnessV0KeyHash(pubkey));
+                    if (!p2wpkh_script.empty()) {
+                        needles.insert(p2wpkh_script);
+                    }
+                    script = GetScriptForDestination(ScriptHash(p2wpkh_script));
+                    if (!script.empty()) {
+                        needles.insert(script);
+                        temp_keystore.scripts[CScriptID(p2wpkh_script)] = p2wpkh_script;
+                    }
+                    auto tap_tweak = XOnlyPubKey(pubkey).CreateTapTweak(nullptr);
+                    if (tap_tweak) {
+                        WitnessV1Taproot output_key{tap_tweak->first};
+                        needles.insert(GetScriptForDestination(output_key));
+                        TaprootBuilder builder;
+                        builder.Finalize(XOnlyPubKey(pubkey));
+                        temp_keystore.tr_trees[output_key] = builder;
+                    }
                 }
             }
         } else if (optname == "label") {
@@ -710,10 +730,12 @@ static RPCHelpMan sweepprivkeys()
         if (IsDust(tx.vout[0], pwallet->chain().relayDustFee())) {
             throw JSONRPCError(RPC_VERIFY_REJECTED, "Swept value would be dust");
         }
+        PrecomputedTransactionData txdata;
+        txdata.Init(tx, std::vector<CTxOut>(input_txos.begin(), input_txos.end()), true);
         for (size_t input_index = 0; input_index < tx.vin.size(); ++input_index) {
             const auto& utxo = input_txos[input_index];
             SignatureData sig_data;
-            MutableTransactionSignatureCreator creator(tx, input_index, utxo.nValue, SIGHASH_ALL);
+            MutableTransactionSignatureCreator creator(tx, input_index, utxo.nValue, &txdata, SIGHASH_ALL);
             if (!ProduceSignature(temp_keystore, creator, utxo.scriptPubKey, sig_data)) {
                 throw JSONRPCError(RPC_MISC_ERROR, "Failed to sign");
             }
@@ -886,7 +908,9 @@ static CBlockUndo GetUndoChecked(BlockManager& blockman, const CBlockIndex& bloc
     return blockUndo;
 }
 
-const RPCResult getblock_vin{
+const RPCResult& GetBlockVin()
+{
+    static const RPCResult getblock_vin{
     RPCResult::Type::ARR, "vin", "",
     {
         {RPCResult::Type::OBJ, "", "",
@@ -909,6 +933,8 @@ const RPCResult getblock_vin{
         }},
     }
 };
+    return getblock_vin;
+}
 
 static RPCHelpMan getblock()
 {
@@ -959,7 +985,7 @@ static RPCHelpMan getblock()
                         {RPCResult::Type::OBJ, "", "",
                         {
                             {RPCResult::Type::ELISION, "", "The transactions in the format of the getrawtransaction RPC. Different from verbosity = 1 \"tx\" result"},
-                            {RPCResult::Type::NUM, "fee", "The transaction fee in " + CURRENCY_UNIT + ", omitted if block undo data is not available"},
+                            {RPCResult::Type::NUM, "fee", /*optional=*/true, "The transaction fee in " + CURRENCY_UNIT + ", omitted if block undo data is not available"},
                         }},
                     }},
                 }},
@@ -971,7 +997,7 @@ static RPCHelpMan getblock()
                     {
                         {RPCResult::Type::OBJ, "", "",
                         {
-                            getblock_vin,
+                            GetBlockVin(),
                         }},
                     }},
                 }},
@@ -1679,6 +1705,7 @@ static void SoftForkDescPushBack(const CBlockIndex* blockindex, UniValue& softfo
         case ThresholdState::LOCKED_IN: return "locked_in";
         case ThresholdState::ACTIVE: return "active";
         case ThresholdState::FAILED: return "failed";
+        case ThresholdState::EXPIRED: return "expired";
         }
         return "invalid";
     };
@@ -1697,6 +1724,9 @@ static void SoftForkDescPushBack(const CBlockIndex* blockindex, UniValue& softfo
     bip9.pushKV("start_time", chainman.GetConsensus().vDeployments[id].nStartTime);
     bip9.pushKV("timeout", chainman.GetConsensus().vDeployments[id].nTimeout);
     bip9.pushKV("min_activation_height", chainman.GetConsensus().vDeployments[id].min_activation_height);
+    if (chainman.GetConsensus().vDeployments[id].max_activation_height < std::numeric_limits<int>::max()) {
+        bip9.pushKV("max_activation_height", chainman.GetConsensus().vDeployments[id].max_activation_height);
+    }
 
     // BIP9 status
     bip9.pushKV("status", get_state_name(current_state));
@@ -1729,7 +1759,13 @@ static void SoftForkDescPushBack(const CBlockIndex* blockindex, UniValue& softfo
     UniValue rv(UniValue::VOBJ);
     rv.pushKV("type", "bip9");
     if (ThresholdState::ACTIVE == next_state) {
-        rv.pushKV("height", chainman.m_versionbitscache.StateSinceHeight(blockindex, chainman.GetConsensus(), id));
+        const int activation_height = chainman.m_versionbitscache.StateSinceHeight(blockindex, chainman.GetConsensus(), id);
+        rv.pushKV("height", activation_height);
+        // Add height_end for temporary softforks
+        const auto& deployment = chainman.GetConsensus().vDeployments[id];
+        if (deployment.active_duration < std::numeric_limits<int>::max()) {
+            rv.pushKV("height_end", activation_height + deployment.active_duration - 1);
+        }
     }
     rv.pushKV("active", ThresholdState::ACTIVE == next_state);
     rv.pushKV("bip9", std::move(bip9));
@@ -1826,7 +1862,8 @@ RPCHelpMan getblockchaininfo()
 namespace {
 const std::vector<RPCResult> RPCHelpForDeployment{
     {RPCResult::Type::STR, "type", "one of \"buried\", \"bip9\""},
-    {RPCResult::Type::NUM, "height", /*optional=*/true, "height of the first block which the rules are or will be enforced (only for \"buried\" type, or \"bip9\" type with \"active\" status)"},
+    {RPCResult::Type::NUM, "height", /*optional=*/true, "height of the first block which enforces the rules (only for \"buried\" type, or \"bip9\" type with \"active\" status)"},
+    {RPCResult::Type::NUM, "height_end", /*optional=*/true, "height of the last block which enforces the rules (only for \"bip9\" type with \"active\" status and temporary deployments)"},
     {RPCResult::Type::BOOL, "active", "true if the rules are enforced for the mempool and the next block"},
     {RPCResult::Type::OBJ, "bip9", /*optional=*/true, "status of bip9 softforks (only for \"bip9\" type)",
     {
@@ -1834,7 +1871,8 @@ const std::vector<RPCResult> RPCHelpForDeployment{
         {RPCResult::Type::NUM_TIME, "start_time", "the minimum median time past of a block at which the bit gains its meaning"},
         {RPCResult::Type::NUM_TIME, "timeout", "the median time past of a block at which the deployment is considered failed if not yet locked in"},
         {RPCResult::Type::NUM, "min_activation_height", "minimum height of blocks for which the rules may be enforced"},
-        {RPCResult::Type::STR, "status", "status of deployment at specified block (one of \"defined\", \"started\", \"locked_in\", \"active\", \"failed\")"},
+        {RPCResult::Type::NUM, "max_activation_height", /*optional=*/true, "height at which the deployment will unconditionally activate (absent for miner-vetoable deployments)"},
+        {RPCResult::Type::STR, "status", "status of deployment at specified block (one of \"defined\", \"started\", \"locked_in\", \"active\", \"failed\", \"expired\")"},
         {RPCResult::Type::NUM, "since", "height of the first block to which the status applies"},
         {RPCResult::Type::STR, "status_next", "status of deployment at the next block"},
         {RPCResult::Type::OBJ, "statistics", /*optional=*/true, "numeric statistics about signalling for a softfork (only for \"started\" and \"locked_in\" status)",
@@ -1860,6 +1898,7 @@ UniValue DeploymentInfo(const CBlockIndex* blockindex, const ChainstateManager& 
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_SEGWIT);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_TESTDUMMY);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_TAPROOT);
+    SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_REDUCED_DATA);
     return softforks;
 }
 } // anon namespace

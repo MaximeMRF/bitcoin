@@ -23,6 +23,7 @@
 #include <net_processing.h>
 #include <netbase.h>
 #include <node/caches.h>
+#include <node/dbcache.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
 #include <node/mempool_args.h> // for ParseDustDynamicOpt
@@ -90,6 +91,7 @@ static const char* SettingName(OptionsModel::OptionID option)
     case OptionsModel::rejectunknownwitness: return "rejectunknownwitness";
     case OptionsModel::rejectparasites: return "rejectparasites";
     case OptionsModel::rejecttokens: return "rejecttokens";
+    case OptionsModel::subdustfeepenalty: return "subdustfeepenalty";
     case OptionsModel::rejectspkreuse: return "rejectspkreuse";
     case OptionsModel::minrelaytxfee: return "minrelaytxfee";
     case OptionsModel::minrelaycoinblocks: return "minrelaycoinblocks";
@@ -694,7 +696,7 @@ QVariant OptionsModel::getOption(OptionID option, const std::string& suffix) con
                suffix.empty()          ? getOption(option, "-prev") :
                                          DEFAULT_PRUNE_TARGET_MiB;
     case DatabaseCache:
-        return qlonglong(SettingToInt(setting(), DEFAULT_DB_CACHE >> 20));
+        return qlonglong(SettingToInt(setting(), node::GetDefaultDBCache() / 1_MiB));
     case ThreadsScriptVerif:
         return qlonglong(SettingToInt(setting(), DEFAULT_SCRIPTCHECK_THREADS));
     case Listen:
@@ -729,6 +731,8 @@ QVariant OptionsModel::getOption(OptionID option, const std::string& suffix) con
         return node().mempool().m_opts.reject_parasites;
     case rejecttokens:
         return node().mempool().m_opts.reject_tokens;
+    case subdustfeepenalty:
+        return node().mempool().m_opts.subdustfeepenalty;
     case rejectspkreuse:
         return f_rejectspkreuse;
     case minrelaytxfee:
@@ -1249,6 +1253,15 @@ bool OptionsModel::setOption(OptionID option, const QVariant& value, const std::
         }
         break;
     }
+    case subdustfeepenalty:
+    {
+        if (changed()) {
+            const bool nv = value.toBool();
+            node().mempool().m_opts.subdustfeepenalty = nv;
+            node().updateRwSetting("subdustfeepenalty", nv);
+        }
+        break;
+    }
     case rejectspkreuse:
         if (changed()) {
             const bool fNewValue = value.toBool();
@@ -1544,7 +1557,7 @@ void OptionsModel::checkAndMigrate()
         // see https://github.com/bitcoin/bitcoin/pull/8273
         // force people to upgrade to the new value if they are using 100MB
         if (settingsVersion < 130000 && settings.contains("nDatabaseCache") && settings.value("nDatabaseCache").toLongLong() == 100)
-            settings.setValue("nDatabaseCache", (qint64)(DEFAULT_DB_CACHE >> 20));
+            settings.setValue("nDatabaseCache", qint64(node::GetDefaultDBCache() / 1_MiB));
 
         settings.setValue(strSettingsVersionKey, CLIENT_VERSION);
     }

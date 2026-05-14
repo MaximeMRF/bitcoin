@@ -21,6 +21,7 @@
 #include <interfaces/node.h>
 #include <netbase.h>
 #include <node/caches.h>
+#include <node/dbcache.h>
 #include <node/chainstatemanager_args.h>
 #include <node/mempool_args.h> // for ParseDustDynamicOpt
 #include <outputtype.h>
@@ -248,9 +249,11 @@ OptionsDialog::OptionsDialog(QWidget* parent, bool enableWallet)
     ui->verticalLayout->setStretchFactor(ui->tabWidget, 1);
 
     /* Main elements init */
-    ui->databaseCache->setRange(MIN_DB_CACHE >> 20, std::numeric_limits<int>::max());
+    ui->databaseCache->setRange(MIN_DBCACHE_BYTES / 1_MiB, std::numeric_limits<int>::max());
     ui->threadsScriptVerif->setMinimum(-GetNumCores());
     ui->threadsScriptVerif->setMaximum(MAX_SCRIPTCHECK_THREADS);
+    ui->threadsWarning->setVisible(false);
+    ui->threadsWarning->setStyleSheet("QLabel { color: red; }");
     ui->pruneWarning->setVisible(false);
     ui->pruneWarning->setStyleSheet("QLabel { color: red; }");
 
@@ -411,6 +414,12 @@ OptionsDialog::OptionsDialog(QWidget* parent, bool enableWallet)
     rejecttokens->setToolTip(tr("With this option enabled, transactions involving non-bitcoin tokens/assets will not be relayed or mined by your node. Due to not having value, and some technical design flaws, token mints and transfers are often spammy and can bog down the network."));
     verticalLayout_Spamfiltering->addWidget(rejecttokens);
     FixTabOrder(rejecttokens);
+
+    subdustfeepenalty = new QCheckBox(groupBox_Spamfiltering);
+    subdustfeepenalty->setText(tr("Penalize effective fee for sub-dust outputs"));
+    subdustfeepenalty->setToolTip(tr("For each output below the dust threshold, reduce the transaction's effective fee by the difference between the dust threshold and the output value. This makes transactions creating dust outputs require higher fees to be relayed and mined."));
+    verticalLayout_Spamfiltering->addWidget(subdustfeepenalty);
+    FixTabOrder(subdustfeepenalty);
 
     minrelaytxfee = new BitcoinAmountField(groupBox_Spamfiltering);
     CreateOptionUI(verticalLayout_Spamfiltering, minrelaytxfee, tr("Ignore transactions offering miners less than %s per kvB in transaction fees."));
@@ -814,6 +823,10 @@ void OptionsDialog::setModel(OptionsModel *_model)
     connect(ui->databaseCache, qOverload<int>(&QSpinBox::valueChanged), this, &OptionsDialog::showRestartWarning);
     connect(ui->externalSignerPath, &QLineEdit::textChanged, [this]{ showRestartWarning(); });
     connect(ui->threadsScriptVerif, qOverload<int>(&QSpinBox::valueChanged), this, &OptionsDialog::showRestartWarning);
+    connect(ui->threadsScriptVerif, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+        ui->threadsWarning->setVisible(value > GetNumCores());
+    });
+    ui->threadsWarning->setVisible(ui->threadsScriptVerif->value() > GetNumCores());
     /* Wallet */
     connect(ui->spendZeroConfChange, &QCheckBox::clicked, this, &OptionsDialog::showRestartWarning);
     /* Network */
@@ -933,6 +946,7 @@ void OptionsDialog::setMapper()
     mapper->addMapping(rejectunknownwitness, OptionsModel::rejectunknownwitness);
     mapper->addMapping(rejectparasites, OptionsModel::rejectparasites);
     mapper->addMapping(rejecttokens, OptionsModel::rejecttokens);
+    mapper->addMapping(subdustfeepenalty, OptionsModel::subdustfeepenalty);
     mapper->addMapping(rejectspkreuse, OptionsModel::rejectspkreuse);
     mapper->addMapping(minrelaytxfee, OptionsModel::minrelaytxfee);
     mapper->addMapping(minrelaycoinblocks, OptionsModel::minrelaycoinblocks);

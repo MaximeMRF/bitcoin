@@ -9,8 +9,10 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <chainparamsbase.h>
 #include <checkqueue.h>
 #include <clientversion.h>
+#include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
@@ -18,6 +20,7 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <cuckoocache.h>
+#include <deploymentinfo.h>
 #include <flatfile.h>
 #include <hash.h>
 #include <kernel/chain.h>
@@ -58,6 +61,7 @@
 #include <util/ioprio.h>
 #include <util/mempressure.h>
 #include <util/moneystr.h>
+#include <util/overflow.h>
 #include <util/rbf.h>
 #include <util/result.h>
 #include <util/signalinterrupt.h>
@@ -142,7 +146,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
-                       std::vector<CScriptCheck>* pvChecks = nullptr)
+                       std::vector<CScriptCheck>* pvChecks = nullptr,
+                       const std::vector<unsigned int>& flags_per_input = {})
                        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& tx)
@@ -985,7 +990,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
     const auto block_height_current = m_active_chainstate.m_chain.Height();
     const auto block_height_next = block_height_current + 1;
-    if (!Consensus::CheckTxInputs(tx, state, m_view, block_height_next, ws.m_base_fees)) {
+    if (!Consensus::CheckTxInputs(tx, state, m_view, block_height_next, ws.m_base_fees, CheckTxInputsRules::OutputSizeLimit)) {
         return false; // state filled in by CheckTxInputs
     }
 
@@ -1079,6 +1084,23 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     ws.m_modified_fees = ws.m_tx_handle->GetModifiedFee();
 
     ws.m_vsize = ws.m_tx_handle->GetTxSize();
+
+    // Reduce effective fee by dust threshold for each sub-dust output
+    if (m_pool.m_opts.subdustfeepenalty) {
+        CAmount dust_penalty{0};
+        for (const auto& txout : tx.vout) {
+            const CAmount dust_threshold = GetDustThreshold(txout, m_pool.m_opts.dust_relay_feerate);
+            if (txout.nValue < dust_threshold) {
+                dust_penalty = SaturatingAdd(dust_penalty, dust_threshold - txout.nValue);
+            }
+        }
+        if (dust_penalty > 0) {
+            m_subpackage.m_changeset->m_to_add.modify(ws.m_tx_handle, [&](CTxMemPoolEntry& e) {
+                e.UpdateModifiedFee(-dust_penalty);
+            });
+            ws.m_modified_fees = SaturatingAdd(ws.m_modified_fees, -dust_penalty);
+        }
+    }
 
     // Enforces 0-fee for dust transactions, no incentive to be mined alone
     if (m_pool.m_opts.require_standard && !ignore_rejects.count("dust")) {
@@ -1444,15 +1466,6 @@ unsigned int PolicyScriptVerifyFlags(const ignore_rejects_type& ignore_rejects)
     } else {
         if (ignore_rejects.count("non-mandatory-script-verify-flag-upgradable-nops")) {
             flags &= ~SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS;
-        }
-        if (ignore_rejects.count("non-mandatory-script-verify-flag-upgradable-witness_program")) {
-            flags &= ~SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM;
-        }
-        if (ignore_rejects.count("non-mandatory-script-verify-flag-upgradable-taproot_version")) {
-            flags &= ~SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
-        }
-        if (ignore_rejects.count("non-mandatory-script-verify-flag-upgradable-op_success")) {
-            flags &= ~SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS;
         }
         if (ignore_rejects.count("non-mandatory-script-verify-flag-upgradable-pubkeytype")) {
             flags &= ~SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE;
@@ -2414,6 +2427,10 @@ ValidationCache::ValidationCache(const size_t script_execution_cache_bytes, cons
  * This involves ECDSA signature checks so can be computationally intensive. This function should
  * only be called after the cheap sanity checks in CheckTxInputs passed.
  *
+ * WARNING: flags_per_input deviations from flags must be handled with care. It should only be more
+ * relaxed than flags, never stricter (or a cached result could be wrong). Do not provide
+ * flags_per_input if every input uses the same flags, or the result will not be cached.
+ *
  * If pvChecks is not nullptr, script checks are pushed onto it instead of being performed inline. Any
  * script checks which are not necessary (eg due to script execution cache hits) are, obviously,
  * not pushed onto pvChecks/run.
@@ -2431,7 +2448,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
-                       std::vector<CScriptCheck>* pvChecks)
+                       std::vector<CScriptCheck>* pvChecks,
+                       const std::vector<unsigned int>& flags_per_input)
 {
     if (tx.IsCoinBase()) return true;
 
@@ -2465,8 +2483,10 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         txdata.Init(tx, std::move(spent_outputs));
     }
     assert(txdata.m_spent_outputs.size() == tx.vin.size());
+    assert(flags_per_input.empty() || flags_per_input.size() == tx.vin.size());
 
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
+        if (!flags_per_input.empty()) flags = flags_per_input[i];
 
         // We very carefully only pass in things to CScriptCheck which
         // are clearly committed to by tx' witness hash. This provides
@@ -2493,7 +2513,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         }
     }
 
-    if (cacheFullScriptStore && !pvChecks) {
+    if (cacheFullScriptStore && (!pvChecks) && flags_per_input.empty()) {
         // We executed all of the provided scripts, and were told to
         // cache the result. Do so now.
         validation_cache.m_script_execution_cache.insert(hashCacheEntry);
@@ -2680,9 +2700,14 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
         flags |= SCRIPT_VERIFY_NULLDUMMY;
     }
 
+    if (DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_REDUCED_DATA)) {
+        flags |= REDUCED_DATA_MANDATORY_VERIFY_FLAGS;
+    }
+
     return flags;
 }
 
+static bool ContextualCheckBlockHeaderVolatile(const CBlockHeader& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 /** Apply the effects of this block (with given index) on the UTXO set represented by coins.
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
@@ -2727,6 +2752,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // verify that the view's current state corresponds to the previous block
     uint256 hashPrevBlock = pindex->pprev == nullptr ? uint256() : pindex->pprev->GetBlockHash();
     assert(hashPrevBlock == view.GetBestBlock());
+
+    if (!ContextualCheckBlockHeaderVolatile(block, state, m_chainman, pindex->pprev)) {
+        LogError("%s: Consensus::ContextualCheckBlockHeaderVolatile: %s\n", __func__, state.ToString());
+        return false;
+    }
 
     m_chainman.num_blocks_total++;
 
@@ -2885,14 +2915,32 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // in multiple threads). Preallocate the vector size so a new allocation
     // doesn't invalidate pointers into the vector, and keep txsdata in scope
     // for as long as `control`.
-    CCheckQueueControl<CScriptCheck> control(fScriptChecks && parallel_script_checks ? &m_chainman.GetCheckQueue() : nullptr);
     std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
+    CCheckQueueControl<CScriptCheck> control(fScriptChecks && parallel_script_checks ? &m_chainman.GetCheckQueue() : nullptr);
+
+    // For BIP9 deployments, get the activation height dynamically
+    const auto reduced_data_start_height = DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_REDUCED_DATA)
+        ? m_chainman.m_versionbitscache.StateSinceHeight(pindex->pprev, params.GetConsensus(), Consensus::DEPLOYMENT_REDUCED_DATA)
+        : std::numeric_limits<int>::max();
+
+    const CheckTxInputsRules chk_input_rules{DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_REDUCED_DATA) ? CheckTxInputsRules::OutputSizeLimit : CheckTxInputsRules::None};
+
+    // Check generation tx output sizes if REDUCED_DATA is active
+    if (chk_input_rules.test(CheckTxInputsRules::OutputSizeLimit)) {
+        TxValidationState tx_state;
+        if (!Consensus::CheckOutputSizes(*block.vtx[0], tx_state)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 tx_state.GetRejectReason(),
+                                 tx_state.GetDebugMessage() + " in generation tx " + block.vtx[0]->GetHash().ToString());
+        }
+    }
 
     std::vector<int> prevheights;
     CAmount nFees = 0;
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
+    std::vector<unsigned int> flags_per_input;
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         if (!state.IsValid()) break;
@@ -2904,7 +2952,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         {
             CAmount txfee = 0;
             TxValidationState tx_state;
-            if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
+            if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee, chk_input_rules)) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(),
@@ -2922,8 +2970,13 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             // BIP68 lock checks (as opposed to nLockTime checks) must
             // be in ConnectBlock because they require the UTXO set
             prevheights.resize(tx.vin.size());
+            flags_per_input.clear();
             for (size_t j = 0; j < tx.vin.size(); j++) {
                 prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
+                if (prevheights[j] < reduced_data_start_height) {
+                    flags_per_input.resize(tx.vin.size(), flags);
+                    flags_per_input[j] = flags & ~REDUCED_DATA_MANDATORY_VERIFY_FLAGS;
+                }
             }
 
             if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex)) {
@@ -2948,7 +3001,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             std::vector<CScriptCheck> vChecks;
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
             TxValidationState tx_state;
-            if (fScriptChecks && !CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, parallel_script_checks ? &vChecks : nullptr)) {
+            if (fScriptChecks && !CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, parallel_script_checks ? &vChecks : nullptr, flags_per_input)) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(), tx_state.GetDebugMessage());
@@ -4587,6 +4640,38 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         }
     }
 
+    if (!ContextualCheckBlockHeaderVolatile(block, state, chainman, pindexPrev)) return false;
+
+    return true;
+}
+
+/** Context-dependent validity checks, but rechecked in ConnectBlock().
+ *  Note that -reindex-chainstate skips the validation that happens here!
+ */
+static bool ContextualCheckBlockHeaderVolatile(const CBlockHeader& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    const Consensus::Params& consensusParams = chainman.GetConsensus();
+
+    // Mandatory signaling for deployments approaching max_activation_height
+    for (int i = 0; i < (int)Consensus::MAX_VERSION_BITS_DEPLOYMENTS; i++) {
+        const Consensus::DeploymentPos pos = static_cast<Consensus::DeploymentPos>(i);
+        const ThresholdState deployment_state = chainman.m_versionbitscache.State(pindexPrev, consensusParams, pos);
+
+        if (DeploymentMustSignalAfter(pindexPrev, consensusParams, pos, deployment_state)) {
+            const auto& deployment = consensusParams.vDeployments[pos];
+            const bool fVersionBits = (block.nVersion & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS;
+            const bool fDeploymentBit = (block.nVersion & (uint32_t{1} << deployment.bit)) != 0;
+
+            if (!(fVersionBits && fDeploymentBit)) {
+                const std::string deployment_name = VersionBitsDeploymentInfo[i].name;
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                   "bad-version-" + deployment_name,
+                                   strprintf("Block must signal for %s approaching max_activation_height=%d",
+                                           deployment_name, deployment.max_activation_height));
+            }
+        }
+    }
+
     return true;
 }
 
@@ -4787,8 +4872,8 @@ bool ChainstateManager::ProcessNewBlockHeaders(std::span<const CBlockHeader> hea
             const CBlockIndex& last_accepted{**ppindex};
             int64_t blocks_left{(NodeClock::now() - last_accepted.Time()) / GetConsensus().PowTargetSpacing()};
             blocks_left = std::max<int64_t>(0, blocks_left);
-            const double progress{100.0 * last_accepted.nHeight / (last_accepted.nHeight + blocks_left)};
-            LogInfo("Synchronizing blockheaders, height: %d (~%.2f%%)\n", last_accepted.nHeight, progress);
+            const int progress = last_accepted.nHeight ? static_cast<int>(1000LL * last_accepted.nHeight / (last_accepted.nHeight + blocks_left)) : 0;
+            LogInfo("Synchronizing blockheaders, height: %d (~%d.%d%%)\n", last_accepted.nHeight, progress / 10, progress % 10);
         }
     }
     return true;
@@ -4814,8 +4899,8 @@ void ChainstateManager::ReportHeadersPresync(const arith_uint256& work, int64_t 
     if (initial_download) {
         int64_t blocks_left{(NodeClock::now() - NodeSeconds{std::chrono::seconds{timestamp}}) / GetConsensus().PowTargetSpacing()};
         blocks_left = std::max<int64_t>(0, blocks_left);
-        const double progress{100.0 * height / (height + blocks_left)};
-        LogInfo("Pre-synchronizing blockheaders, height: %d (~%.2f%%)\n", height, progress);
+        const int progress = height ? static_cast<int>(1000LL * height / (height + blocks_left)) : 0;
+        LogInfo("Pre-synchronizing blockheaders, height: %d (~%d.%d%%)\n", height, progress / 10, progress % 10);
     }
 }
 
@@ -5058,9 +5143,9 @@ bool Chainstate::LoadChainTip()
     auto target = tip;
     while (target) {
         const bool is_candidate{setBlockIndexCandidates.contains(target)};
-        if (is_candidate) setBlockIndexCandidates.erase(tip);
+        if (is_candidate) setBlockIndexCandidates.erase(target);
         target->nSequenceId = SEQ_ID_BEST_CHAIN_FROM_DISK;
-        if (is_candidate) setBlockIndexCandidates.insert(tip);
+        if (is_candidate) setBlockIndexCandidates.insert(target);
         target = target->pprev;
     }
     PruneBlockIndexCandidates();
@@ -6663,6 +6748,31 @@ ChainstateManager::ChainstateManager(const util::SignalInterrupt& interrupt, Opt
       m_blockman{interrupt, std::move(blockman_options)},
       m_validation_cache{m_options.script_execution_cache_bytes, m_options.signature_cache_bytes}
 {
+    if (GetParams().IsTestChain()
+        ? (!g_enable_rdts)
+        : GetConsensus().vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nStartTime == Consensus::BIP9Deployment::NEVER_ACTIVE) {
+        m_options.notifications.warningSet(kernel::Warning::RULES_NOT_CONSENTED,
+            strprintf(_("Warning: RDTS is not enabled. This node is therefore vulnerable to displaying fake or fraudulent transactions. To enable RDTS enforcement and disable this warning, add %s to your %s file."),
+                CONSENSUSRULES_CONFIG_NAME + "=" + CONSENSUSRULES_REQUIRED,
+#ifdef BUILDING_FOR_LIBBITCOINKERNEL
+                "bitcoin.conf"
+#else
+                gArgs.GetPathArg("-conf", BITCOIN_CONF_FILENAME).utf8string()
+#endif
+            )
+        );
+    } else if (g_rdts_warning) {
+        m_options.notifications.warningSet(kernel::Warning::RULES_NOT_CONSENTED,
+            strprintf(_("Warning: This software applies the BIP110/RDTS network upgrade, but explicit confirmation has not been configured. To confirm this upgrade and dismiss this warning, add %s to your %s file."),
+                CONSENSUSRULES_CONFIG_NAME + "=" + CONSENSUSRULES_REQUIRED,
+#ifdef BUILDING_FOR_LIBBITCOINKERNEL
+                "bitcoin.conf"
+#else
+                gArgs.GetPathArg("-conf", BITCOIN_CONF_FILENAME).utf8string()
+#endif
+            )
+        );
+    }
 }
 
 ChainstateManager::~ChainstateManager()

@@ -66,6 +66,8 @@ static constexpr unsigned int DEFAULT_BYTES_PER_SIGOP_STRICT{20};
 static constexpr unsigned int DEFAULT_WEIGHT_PER_DATA_BYTE{4};
 /** Default for -rejecttokens */
 static constexpr bool DEFAULT_REJECT_TOKENS{false};
+/** Default for -subdustfeepenalty */
+static constexpr bool DEFAULT_SUBDUSTFEEPENALTY{true};
 
 // NOTE: Changes to these three require manually adjusting doc in init.cpp
 /** Default for -permitephemeral=send */
@@ -170,7 +172,8 @@ static constexpr unsigned int STANDARD_SCRIPT_VERIFY_FLAGS{MANDATORY_SCRIPT_VERI
                                                              SCRIPT_VERIFY_CONST_SCRIPTCODE |
                                                              SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION |
                                                              SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS |
-                                                             SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE};
+                                                             SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE |
+                                                             REDUCED_DATA_MANDATORY_VERIFY_FLAGS};
 
 /** For convenience, standard but not mandatory verify flags. */
 static constexpr unsigned int STANDARD_NOT_MANDATORY_VERIFY_FLAGS{STANDARD_SCRIPT_VERIFY_FLAGS & ~MANDATORY_SCRIPT_VERIFY_FLAGS};
