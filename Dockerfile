@@ -18,5 +18,5 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /bitcoin
 
 CMD rm -rf build && \
-    cmake -B build -DBUILD_GUI=OFF -DBUILD_ZMQ=ON -DUSE_UPNP=ON -DUSE_NATPMP=ON && \
+    cmake -B build -DBUILD_GUI=OFF -DWITH_ZMQ=ON -DWITH_MINIUPNPC=ON -DUSE_NATPMP=ON -DRDTS_CONSENT=IMPLICIT && \
     cmake --build build -j$(nproc)
